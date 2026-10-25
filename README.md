@@ -13,7 +13,8 @@
 - **临时覆盖**：对话中可要求「这次不用 X 技能 / 只用 Y 技能」，只影响本次对话；勾选状态持久保存，关窗、重启 VS Code 都不丢失
 - **调用方式可切换**：设置 `skillQuickLaunch.activationMode` 选 `route`（命中即调用，默认）或 `always`（每次新对话预读全部已勾选技能）
 - **自建技能可编辑**：自建技能的显示名称与描述可自定义填写、保存、修改、还原默认；第三方技能（联网安装的）锁定不可修改，并有「第三方」徽标
-- **自动勾选**：读取本地 Copilot 会话记录（Windows / macOS / Linux 均支持），**对话中实际调用过的技能会自动勾选并同步**
+- **真实调用检测**：读取本地 Copilot 会话记录（Windows / macOS / Linux 均支持），只识别完成的 `read_file` / `copilot_readFile` 等文件读取执行事件，不会把系统提示词或待执行请求中的路径误判为调用；实际调用过的技能会自动勾选并显示“已调用”徽章
+- **与 HWChat 联动**：HWChat 实际加载 `~/.copilot/skills` 中的 Skill 后，会写入同一份 `lastUsed` 状态；两个扩展都能显示最近确认调用的技能
 - **手动取消优先**：手动取消的技能不会被旧记录勾回；只有再次在对话中被调用才重新激活
 - **隐私安全**：只读取本机文件（技能目录 + 会话记录），不联网、不上传
 
@@ -30,7 +31,7 @@
 
 ## 设置
 
-- `skillQuickLaunch.autoDetect`：自动检测对话中调用过的技能（默认开）
+- `skillQuickLaunch.autoDetect`：自动检测对话中真实执行过的技能读取（默认开）
 - `skillQuickLaunch.pollIntervalSeconds`：会话记录扫描间隔，默认 10 秒
 - `skillQuickLaunch.activationMode`：`route` 命中即调用（默认）/ `always` 每次预读全部
 
@@ -39,14 +40,14 @@
 ```bash
 npm install
 npm run compile
-npm run package   # 生成 local-skill-quick-launch-0.4.1.vsix
-code --install-extension local-skill-quick-launch-0.4.1.vsix
+npm run package   # 生成 local-skill-quick-launch-0.4.2.vsix
+code --install-extension local-skill-quick-launch-0.4.2.vsix
 ```
 
 ## 说明
 
 - 仅管理个人级技能（`~/.copilot/skills/`）；项目级与扩展内置技能不受影响
-- 激活清单、自定义名称/描述、分类改名、自建分类与技能分类归属都存于 `~/.copilot/.skill-quick-launch.json`（旧版 `.active-skills.json` 自动迁移，新增字段缺省即用默认值）
+- 激活清单、自定义名称/描述、分类改名、自建分类、技能分类归属和最近真实调用时间都存于 `~/.copilot/.skill-quick-launch.json`（旧版 `.active-skills.json` 自动迁移，新增字段缺省即用默认值）
 - 写入全局指令的区块夹在 `<!-- SKILLS-MANAGER:START/END -->` 之间，升级/卸载不破坏文件其他内容
 - 勾选后**新会话**生效（当前会话不会重新加载全局指令）
 

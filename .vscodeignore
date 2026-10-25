@@ -1,7 +1,9 @@
 node_modules/
 *.vsix
 .DS_Store
+.gitignore
 src/**
+test/**
 tsconfig.json
 test-parse.js
 **/*.map

@@ -42,6 +42,7 @@ interface SkillInfo {
   zhDesc: string;  // 中文描述（≤50 字）
   category: string; // 分类 id（见 skill-zh.ts CATEGORY_ORDER）
   origin: 'self' | 'third'; // 自建（可编辑） / 第三方（锁定）
+  lastUsedAt?: number; // 最近一次从真实工具执行或兼容扩展注入中确认的调用时间
 }
 
 function parseSkillMd(file: string): {
@@ -111,6 +112,7 @@ function classifySkill(name: string, rawDesc: string, st: ActiveState): 'self' |
 interface ActiveState {
   active: string[];
   unchecked: Record<string, number>; // 用户手动取消勾选的时间戳（晚于该时间的命中才自动勾回）
+  lastUsed: Record<string, number>; // 技能名 → 最近一次确认调用时间；供 HWChat 等扩展共享
   custom: Record<string, { title: string; desc: string }>; // 自建技能的自定义名称/描述
   origins: Record<string, 'self' | 'third'>; // 用户显式指定的来源标记
   /** 内置分类改名（id → 标题）；空/缺失用默认名 */
@@ -125,6 +127,7 @@ function emptyState(): ActiveState {
   return {
     active: [],
     unchecked: {},
+    lastUsed: {},
     custom: {},
     origins: {},
     categoryTitles: {},
@@ -139,6 +142,7 @@ function readActiveState(): ActiveState {
     return {
       active: Array.isArray(j.active) ? j.active : [],
       unchecked: j.unchecked && typeof j.unchecked === 'object' ? j.unchecked : {},
+      lastUsed: j.lastUsed && typeof j.lastUsed === 'object' ? j.lastUsed : {},
       custom: j.custom && typeof j.custom === 'object' ? j.custom : {},
       origins: j.origins && typeof j.origins === 'object' ? j.origins : {},
       categoryTitles:
@@ -219,7 +223,16 @@ function listSkills(): SkillInfo[] {
         zhDesc = (p.brief || p.title).slice(0, 50);
       }
       const category = resolveCategory(p.name, st.skillCategory[p.name], validCats);
-      out.push({ ...p, active: activeSet.has(p.name), file, zhTitle, zhDesc, category, origin });
+      out.push({
+        ...p,
+        active: activeSet.has(p.name),
+        file,
+        zhTitle,
+        zhDesc,
+        category,
+        origin,
+        lastUsedAt: Number.isFinite(st.lastUsed[p.name]) ? st.lastUsed[p.name] : undefined,
+      });
     } catch { /* skip unreadable */ }
   }
   return out.sort((a, b) => Number(b.active) - Number(a.active) || a.name.localeCompare(b.name));
@@ -490,6 +503,7 @@ class SkillsViewProvider implements vscode.WebviewViewProvider {
     const skills = listSkills();
     const st = readActiveState();
     const activeCount = skills.filter((s) => s.active).length;
+    const usedCount = skills.filter((s) => Boolean(s.lastUsedAt)).length;
     // 分类顺序：内置（可改名）→ 自建 → 未分类；空分类默认不显示，自建分类即使为空也显示（可拖入）
     const categories: CategoryDef[] = buildCategoryList(st.categoryTitles, st.customCategories);
     const groups = categories
@@ -512,6 +526,9 @@ class SkillsViewProvider implements vscode.WebviewViewProvider {
       const activeCount = g.items.filter((s) => s.active).length;
       const rows = g.items.map((s) => {
         const trig = s.triggers.length > 60 ? s.triggers.slice(0, 60) + '…' : s.triggers;
+        const usedBadge = s.lastUsedAt
+          ? `<span class="badge used" title="最近确认调用：${this.esc(new Date(s.lastUsedAt).toLocaleString('zh-CN'))}">已调用</span>`
+          : '';
         const acts = s.origin === 'self'
           ? `<button class="act" data-act="edit" title="编辑名称与描述（自建技能）">✎</button>
              <button class="act" data-act="third" title="锁定为第三方（锁定后不可编辑）">🔒</button>`
@@ -526,7 +543,7 @@ class SkillsViewProvider implements vscode.WebviewViewProvider {
           <span class="circle"></span>
         </label>
         <div class="info">
-          <div class="top"><span class="name">${this.esc(s.zhTitle)}</span><span class="ename">${this.esc(s.name)}</span>${s.origin === 'third' ? '<span class="badge" title="第三方技能：名称与描述不可修改">第三方</span>' : ''}</div>
+          <div class="top"><span class="name">${this.esc(s.zhTitle)}</span><span class="ename">${this.esc(s.name)}</span>${usedBadge}${s.origin === 'third' ? '<span class="badge" title="第三方技能：名称与描述不可修改">第三方</span>' : ''}</div>
           <div class="desc">${this.esc(s.zhDesc)}</div>
           ${trig ? `<div class="trig">触发: ${this.esc(trig)}</div>` : ''}
         </div>
@@ -616,6 +633,7 @@ class SkillsViewProvider implements vscode.WebviewViewProvider {
   .name { font-weight: 600; font-size: 12.5px; }
   .ename { color: var(--muted); font-size: 10px; }
   .badge { color: var(--muted); border: 1px solid var(--border); border-radius: 980px; padding: 0 5px; font-size: 9px; line-height: 1.5; }
+  .badge.used { color: var(--vscode-testing-iconPassed, #2ea043); border-color: color-mix(in srgb, var(--vscode-testing-iconPassed, #2ea043) 55%, transparent); }
   .desc { color: var(--fg); opacity: .92; margin-top: 1px; line-height: 1.4; }
   .trig { color: var(--muted); font-size: 10.5px; margin-top: 2px; word-break: break-all; }
   .acts { flex: none; display: flex; gap: 2px; margin-top: 1px; opacity: .85; }
@@ -640,10 +658,10 @@ class SkillsViewProvider implements vscode.WebviewViewProvider {
 </style>
 </head>
 <body>
-  <div class="hint">✓ 勾选 = <b>默认激活</b>：对话内容命中该技能的用途或触发词时，Copilot 会先读取并按其执行，不用再点名。分类可 ✎ 改名、＋ 新建；技能用 🗂 或直接拖到别的分类即可换组。</div>
+  <div class="hint">✓ 勾选表示<b>可被路由调用</b>，不等于每轮都已执行；只有检测到 Copilot 真正读取 <code>SKILL.md</code>，或兼容扩展确认注入后，才显示“已调用”。分类可改名、新建，技能可拖动换组。</div>
   <input id="filter" type="text" placeholder="搜索技能名称 / 用途…" />
   <div class="bar">
-    <span class="total" id="totalText">共 ${skills.length} 项 · 激活 ${activeCount} 项</span>
+    <span class="total" id="totalText">共 ${skills.length} 项 · 激活 ${activeCount} 项 · 已确认调用 ${usedCount} 项</span>
     <button id="all">全选</button>
     <button id="none">清空</button>
     <button id="newcat">＋ 分类</button>
@@ -930,7 +948,7 @@ class SkillsViewProvider implements vscode.WebviewViewProvider {
         const s = document.getElementById('status');
         s.textContent = '已保存 (' + m.count + ' 个激活，新对话默认执行)';
         const t = document.getElementById('totalText');
-        if (t && m.total !== undefined) { t.textContent = '共 ' + m.total + ' 项 · 激活 ' + m.count + ' 项'; }
+        if (t && m.total !== undefined) { t.textContent = '共 ' + m.total + ' 项 · 激活 ' + m.count + ' 项 · 已确认调用 ${usedCount} 项'; }
         setTimeout(() => { s.textContent = ''; }, 4000);
       }
       if (m && m.command === 'moved') { applyMoved(m); }
@@ -985,6 +1003,15 @@ export function activate(context: vscode.ExtensionContext): void {
   } catch {
     /* 监听失败时仍可通过「刷新」按钮或重开面板重扫 */
   }
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    const stateWatcher = fs.watch(path.dirname(STATE_FILE), (event, filename) => {
+      if (filename === path.basename(STATE_FILE)) scheduleRefresh();
+    });
+    context.subscriptions.push({ dispose: () => stateWatcher.close() });
+  } catch {
+    /* 共享状态监听失败时，重新打开面板仍会刷新。 */
+  }
 
   // ---- 自动勾选：扫描 Copilot 会话记录，对话中调用过的技能自动激活 ----
   const cfg = vscode.workspace.getConfiguration('skillQuickLaunch');
@@ -997,18 +1024,27 @@ export function activate(context: vscode.ExtensionContext): void {
         const hits = scanTranscripts(known);
         const st = readActiveState();
         const autoAdded: string[] = [];
+        let stateChanged = false;
         for (const [name, ts] of hits) {
           if (!skillExists(name)) { continue; }
+          if (ts > (st.lastUsed[name] ?? 0)) {
+            st.lastUsed[name] = ts;
+            stateChanged = true;
+          }
           if (st.active.includes(name)) { continue; }
           const uncheckedTs = st.unchecked[name] ?? 0;
           if (ts > uncheckedTs) {
             st.active.push(name);
             delete st.unchecked[name];
             autoAdded.push(name);
+            stateChanged = true;
           }
         }
-        if (autoAdded.length > 0) {
+        if (stateChanged) {
           writeActiveState(st);
+          provider.refresh();
+        }
+        if (autoAdded.length > 0) {
           syncInstructions(listSkills().filter((s) => s.active));
           provider.notifyAutoAdded(autoAdded);
         }
