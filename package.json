@@ -2,7 +2,7 @@
 	"name": "local-skill-quick-launch",
 	"displayName": "本地skill快捷调用",
 	"description": "可视化勾选管理本地 Copilot 技能：分类可改名/新建/拖动换组，勾选即默认激活，对话命中用途或触发词时自动调用。",
-	"version": "0.5.0",
+	"version": "0.4.1",
 	"publisher": "honor-world",
 	"license": "MIT",
 	"icon": "icon.png",

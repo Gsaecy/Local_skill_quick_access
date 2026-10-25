@@ -39,8 +39,8 @@
 ```bash
 npm install
 npm run compile
-npm run package   # 生成 local-skill-quick-launch-0.5.0.vsix
-code --install-extension local-skill-quick-launch-0.5.0.vsix
+npm run package   # 生成 local-skill-quick-launch-0.4.1.vsix
+code --install-extension local-skill-quick-launch-0.4.1.vsix
 ```
 
 ## 说明

@@ -1,3 +1,7 @@
 node_modules/
 *.vsix
 .DS_Store
+src/**
+tsconfig.json
+test-parse.js
+**/*.map
