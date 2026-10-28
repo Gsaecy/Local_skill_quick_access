@@ -11,12 +11,18 @@ import {
   type CategoryDef,
 } from './skill-zh';
 import { scanTranscripts } from './transcripts';
+import { activeSignature, shouldSyncInstructions } from './sharedState';
+import {
+  STATE_FILE,
+  type ActiveState,
+  markUnchecked,
+  readActive,
+  readActiveState,
+  writeActive,
+  writeActiveState,
+} from './activeState';
 
 const SKILLS_DIR = path.join(os.homedir(), '.copilot', 'skills');
-/** 状态文件放在 skills 目录之外，避免自身写入触发目录监听导致面板刷新（分类折叠丢失） */
-const STATE_FILE = path.join(os.homedir(), '.copilot', '.skill-quick-launch.json');
-/** 旧版状态文件位置（0.3.x），读取后迁移并删除 */
-const LEGACY_STATE_FILE = path.join(SKILLS_DIR, '.active-skills.json');
 /** 联网安装日志（skill-web-installer 维护），installed 记录视为第三方技能 */
 const INSTALL_LOG = path.join(SKILLS_DIR, '.skill-install-log.md');
 const INSTRUCTIONS = path.join(os.homedir(), '.github', 'copilot-instructions.md');
@@ -107,91 +113,6 @@ function classifySkill(name: string, rawDesc: string, st: ActiveState): 'self' |
   if (installLogNames().has(name)) { return 'third'; }
   if (/\b(?:https?:\/\/)?(?:www\.)?(github\.com|gitlab\.com|bitbucket\.org)\/[\w.-]+\/[\w.-]+/i.test(rawDesc)) { return 'third'; }
   return 'self';
-}
-
-interface ActiveState {
-  active: string[];
-  unchecked: Record<string, number>; // 用户手动取消勾选的时间戳（晚于该时间的命中才自动勾回）
-  lastUsed: Record<string, number>; // 技能名 → 最近一次确认调用时间；供 HWChat 等扩展共享
-  custom: Record<string, { title: string; desc: string }>; // 自建技能的自定义名称/描述
-  origins: Record<string, 'self' | 'third'>; // 用户显式指定的来源标记
-  /** 内置分类改名（id → 标题）；空/缺失用默认名 */
-  categoryTitles: Record<string, string>;
-  /** 用户自建分类（按创建顺序追加在内置分类之后） */
-  customCategories: { id: string; title: string }[];
-  /** 技能 → 分类的手动指定；优先于内置映射 */
-  skillCategory: Record<string, string>;
-}
-
-function emptyState(): ActiveState {
-  return {
-    active: [],
-    unchecked: {},
-    lastUsed: {},
-    custom: {},
-    origins: {},
-    categoryTitles: {},
-    customCategories: [],
-    skillCategory: {},
-  };
-}
-
-function readActiveState(): ActiveState {
-  try {
-    const j = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    return {
-      active: Array.isArray(j.active) ? j.active : [],
-      unchecked: j.unchecked && typeof j.unchecked === 'object' ? j.unchecked : {},
-      lastUsed: j.lastUsed && typeof j.lastUsed === 'object' ? j.lastUsed : {},
-      custom: j.custom && typeof j.custom === 'object' ? j.custom : {},
-      origins: j.origins && typeof j.origins === 'object' ? j.origins : {},
-      categoryTitles:
-        j.categoryTitles && typeof j.categoryTitles === 'object' ? j.categoryTitles : {},
-      customCategories: Array.isArray(j.customCategories)
-        ? j.customCategories.filter(
-            (c: unknown): c is { id: string; title: string } =>
-              !!c && typeof (c as { id?: unknown }).id === 'string',
-          )
-        : [],
-      skillCategory:
-        j.skillCategory && typeof j.skillCategory === 'object' ? j.skillCategory : {},
-    };
-  } catch { /* 首次使用或文件损坏 */ }
-  // 迁移旧版状态（~/.copilot/skills/.active-skills.json）
-  try {
-    if (fs.existsSync(LEGACY_STATE_FILE)) {
-      const j = JSON.parse(fs.readFileSync(LEGACY_STATE_FILE, 'utf8'));
-      const st = emptyState();
-      if (Array.isArray(j.active)) { st.active = j.active; }
-      if (j.unchecked && typeof j.unchecked === 'object') { st.unchecked = j.unchecked; }
-      writeActiveState(st);
-      try { fs.unlinkSync(LEGACY_STATE_FILE); } catch { /* 删除失败不影响功能 */ }
-      return st;
-    }
-  } catch { /* 旧文件不可读时忽略 */ }
-  return emptyState();
-}
-
-function writeActiveState(state: ActiveState): void {
-  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-}
-
-function writeActive(names: string[]): void {
-  const st = readActiveState();
-  st.active = names;
-  writeActiveState(st);
-}
-
-function readActive(): string[] {
-  return readActiveState().active;
-}
-
-/** 用户手动取消勾选：记录时间戳，避免被旧记录自动勾回 */
-function markUnchecked(name: string): void {
-  const st = readActiveState();
-  st.unchecked[name] = Date.now();
-  writeActiveState(st);
 }
 
 function listSkills(): SkillInfo[] {
@@ -321,6 +242,59 @@ function syncInstructions(active: SkillInfo[]): string {
   return INSTRUCTIONS;
 }
 
+/**
+ * 共享状态文件此刻是否是一份能完整解析的状态。
+ *
+ * 写入方（本扩展与 HWChat）都不是原子替换：先截断再写，中间那一瞬读到的是空文件。
+ * 监听器要据此决定「这一轮先别动全局指令」，而不是把空清单当成用户的真实选择。
+ * 下一次文件事件会再来一次，不会漏掉改动。
+ */
+function sharedStateReadable(): boolean {
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    return Boolean(parsed) && typeof parsed === 'object' && !Array.isArray(parsed)
+      && Array.isArray((parsed as { active?: unknown }).active);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 上一次真正写进全局指令的勾选集合签名；`null` 表示还没同步过。
+ *
+ * 只有「勾选集合变了」才重写指令块。理由见 `sharedState.ts`：HWChat 每轮加载 Skill
+ * 都会往共享状态文件写 `lastUsed`，若每次变更都重写，等于每次模型调用前都改一遍
+ * `~/.github/copilot-instructions.md`。
+ */
+let syncedSignature: string | null = null;
+
+/**
+ * 按当前勾选同步全局指令。
+ *
+ * @param force 展示内容也变了时必须为真（改显示名、换分类、激活模式切换、启动时的
+ *   格式升级），这些改动不体现在勾选集合里，靠签名比对永远判不出「需要重写」。
+ * @returns 是否真的写了文件。
+ */
+function syncActiveIfChanged(force = false): boolean {
+  let active: SkillInfo[];
+  try {
+    active = listSkills().filter((s) => s.active);
+  } catch {
+    return false;
+  }
+  const names = active.map((s) => s.name);
+  const signature = activeSignature(names);
+  if (!shouldSyncInstructions(syncedSignature, names, force)) { return false; }
+  try {
+    syncInstructions(active);
+    syncedSignature = signature;
+    return true;
+  } catch {
+    // 写入失败不记签名：下次状态变化（或启动）还会再试，不会永久停在旧指令上。
+    return false;
+  }
+}
+
 class SkillsViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'skillsManager.listView';
   private _view?: vscode.WebviewView;
@@ -347,7 +321,7 @@ class SkillsViewProvider implements vscode.WebviewViewProvider {
           }
           writeActive(active);
           const skills = listSkills();
-          syncInstructions(skills.filter((s) => s.active));
+          syncActiveIfChanged();
           // 不刷新整个面板：分类折叠状态保持不变
           this.post({ command: 'saved', count: active.length, total: skills.length });
           break;
@@ -393,13 +367,13 @@ class SkillsViewProvider implements vscode.WebviewViewProvider {
         case 'selectAll': {
           const skills = listSkills();
           writeActive(skills.map((s) => s.name));
-          syncInstructions(skills);
+          syncActiveIfChanged();
           this.refreshHtml();
           break;
         }
         case 'clearAll': {
           writeActive([]);
-          syncInstructions([]);
+          syncActiveIfChanged();
           this.refreshHtml();
           break;
         }
@@ -471,11 +445,13 @@ class SkillsViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
-  /** 按当前激活清单重写全局指令（勾选/改名/换分类后都需要） */
+  /**
+   * 按当前激活清单重写全局指令。
+   *
+   * 改名 / 换分类只改展示内容，勾选集合没变，所以必须强制重写（签名比对看不出区别）。
+   */
   private syncActive(): void {
-    try {
-      syncInstructions(listSkills().filter((s) => s.active));
-    } catch { /* 写入失败不影响面板 */ }
+    syncActiveIfChanged(true);
   }
 
   /** 自动勾选：会话记录中命中且未被用户取消的技能 */
@@ -975,9 +951,9 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   // ---- 启动即同步：把当前激活清单按最新格式写入全局指令（升级后无需手动重新勾选）----
-  try {
-    syncInstructions(listSkills().filter((s) => s.active));
-  } catch { /* 写入失败不影响面板功能 */ }
+  // 启动这次必须强制：格式升级、显示名与分类都可能变，勾选集合却一模一样，
+  // 只靠签名比对会让旧格式的指令块一直留在用户机器上。
+  syncActiveIfChanged(true);
 
   // ---- 目录监听：新增/删除技能后自动刷新面板（无需手动点刷新）----
   let watchTimer: ReturnType<typeof setTimeout> | undefined;
@@ -1005,10 +981,34 @@ export function activate(context: vscode.ExtensionContext): void {
   }
   try {
     fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    /**
+     * 共享状态文件变了：可能是在本面板里勾的，也可能是 **HWChat 的对话面板**改的
+     * （那边读写同一份 `active`）。所以除了重画面板，还要按新勾选重写全局指令，
+     * 否则 `~/.github/copilot-instructions.md` 会一直停在旧清单上，直到重启 VS Code。
+     */
+    let stateTimer: ReturnType<typeof setTimeout> | undefined;
+    const scheduleStateSync = (): void => {
+      if (stateTimer) { clearTimeout(stateTimer); }
+      stateTimer = setTimeout(() => {
+        // 先确认文件能被完整解析：写入方不是原子替换（写一半会被读到空清单），
+        // 那种情况下把「暂无激活技能」写进全局指令是实打实的错误。
+        if (!sharedStateReadable()) { return; }
+        syncActiveIfChanged();
+        try {
+          provider.refresh();
+        } catch { /* 面板未打开时刷新失败无害 */ }
+      }, 600);
+    };
     const stateWatcher = fs.watch(path.dirname(STATE_FILE), (event, filename) => {
-      if (filename === path.basename(STATE_FILE)) scheduleRefresh();
+      // 有些平台/文件系统给不出 filename，那种情况宁可多同步一次，也不要漏掉别人的勾选改动。
+      if (!filename || filename === path.basename(STATE_FILE)) { scheduleStateSync(); }
     });
-    context.subscriptions.push({ dispose: () => stateWatcher.close() });
+    context.subscriptions.push({
+      dispose: () => {
+        if (stateTimer) { clearTimeout(stateTimer); }
+        stateWatcher.close();
+      },
+    });
   } catch {
     /* 共享状态监听失败时，重新打开面板仍会刷新。 */
   }
@@ -1045,7 +1045,7 @@ export function activate(context: vscode.ExtensionContext): void {
           provider.refresh();
         }
         if (autoAdded.length > 0) {
-          syncInstructions(listSkills().filter((s) => s.active));
+          syncActiveIfChanged();
           provider.notifyAutoAdded(autoAdded);
         }
       } catch { /* 扫描失败不影响手动功能 */ }
